@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Tulum DESK — Screen Share</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(1200px 800px at 50% -10%, #10202b 0%, #070a0e 60%, #04060a 100%);
+    color: #eaffff; font: 16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+  }
+  .card {
+    width: min(560px, 92vw); padding: 34px 30px 28px; border-radius: 18px;
+    background: rgba(12, 20, 28, 0.86); border: 1px solid #16323f;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5); text-align: center;
+  }
+  h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: 0.5px; }
+  h1 .accent { color: #5fb8cc; }
+  .sub { margin: 0 0 22px; color: #7fa6b3; font-size: 13px; }
+  button {
+    font: 600 17px system-ui, sans-serif; color: #eaffff; cursor: pointer;
+    border: 1px solid #5fb8cc; border-radius: 12px; padding: 15px 22px; margin: 6px;
+    background: linear-gradient(#164254, #0e2c3a); transition: transform .08s, filter .15s;
+    min-width: 170px;
+  }
+  button:hover { filter: brightness(1.15); }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.4; cursor: default; filter: none; }
+  #stop { border-color: #7a3a3a; background: linear-gradient(#4a1f1f, #331616); }
+  .status {
+    margin-top: 20px; padding: 12px 14px; border-radius: 10px; font-size: 14px;
+    background: #0a1620; border: 1px solid #16323f; min-height: 20px;
+    color: #8fd6e6; word-break: break-word;
+  }
+  .status.ok { color: #7fe6a8; border-color: #1f6b45; }
+  .status.err { color: #ff9a9a; border-color: #7a2323; }
+  .status.warn { color: #ffd98f; border-color: #7a6423; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: #446; }
+  .dot.live { background: #35d67a; box-shadow: 0 0 8px #35d67a; }
+  .dot.wait { background: #e0c05a; }
+  .dot.err { background: #d65a5a; }
+  .meta { margin-top: 14px; font-size: 11px; color: #557; }
+  code { color: #9fd; background: #0c1a24; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Tulum <span class="accent">DESK</span> — Screen Share</h1>
+    <p class="sub">Share this machine's screen into the Tulum venue (peer-to-peer, LAN).</p>
+    <div>
+      <button id="share">Share Screen</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+    <div id="status" class="status"><span class="dot" id="dot"></span><span id="msg">Idle — click “Share Screen” to begin.</span></div>
+    <div class="meta">room <code id="room">tulum-desk</code> · role <code>sharer</code> · signal <code id="base">…</code></div>
+  </div>
+
+<script>
+"use strict";
+// ── SIGNALING CONFIG (the fixed-room mailbox Worker — already live) ──
+const SIGNAL_BASE = "https://tulum-desk-signal.hartwell.workers.dev";
+const ROOM = "tulum-desk";          // fixed shared room code (auto-pair, no pin)
+const ROLE = "sharer";              // this page; the venue is "viewer"
+const ICE  = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
+const POLL_MS = 700;
+const OFFER_COOLDOWN_MS = 2000;     // don't re-offer more often than this on repeated viewer "ready"
+
+// ── UI ──
+const $ = (id) => document.getElementById(id);
+const shareBtn = $("share"), stopBtn = $("stop"), msgEl = $("msg"), statusEl = $("status"), dotEl = $("dot");
+$("base").textContent = SIGNAL_BASE.replace("https://", "");
+function setStatus(text, kind /* '', 'ok','err','warn' */, dot /* '', 'live','wait','err' */) {
+  msgEl.textContent = text;
+  statusEl.className = "status" + (kind ? " " + kind : "");
+  dotEl.className = "dot" + (dot ? " " + dot : "");
+}
+
+// ── STATE ──
+let stream = null, pc = null, running = false, since = 0, pollT = null, lastOffer = 0, connected = false;
+const pendingIce = [];
+
+// ── signaling helpers (async; swallow errors so the poll loop never dies) ──
+async function post(type, data) {
+  try { await fetch(`${SIGNAL_BASE}/signal/${ROOM}/${ROLE}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type, data: data ?? null }) }); }
+  catch (e) { /* keep going */ }
+}
+async function resetRoom() { try { await fetch(`${SIGNAL_BASE}/signal/${ROOM}/reset`, { method: "POST" }); } catch (e) {} }
+async function inbox() {
+  try { const r = await fetch(`${SIGNAL_BASE}/signal/${ROOM}/${ROLE}/inbox?since=${since}`); return r.ok ? await r.json() : null; }
+  catch (e) { return null; }
+}
+
+// ── build a fresh peer connection with the display tracks + create/post an offer ──
+async function negotiate() {
+  if (pc) { try { pc.close(); } catch (e) {} }
+  connected = false;
+  pc = new RTCPeerConnection({ iceServers: ICE });
+  pc.onicecandidate = (e) => { if (e.candidate) post("ice", e.candidate.toJSON ? e.candidate.toJSON() : e.candidate); };
+  pc.onconnectionstatechange = () => {
+    const st = pc.connectionState;
+    if (st === "connected") { connected = true; const label = stream?.getVideoTracks?.()[0]?.label || "screen"; setStatus("Sharing — " + label, "ok", "live"); }
+    else if (st === "connecting") { if (!connected) setStatus("Connecting to venue…", "warn", "wait"); }
+    else if (st === "failed") { connected = false; setStatus("Connection failed — is the venue in DESK mode? Retrying…", "err", "err"); }
+    else if (st === "disconnected") { connected = false; setStatus("Peer disconnected — waiting…", "warn", "wait"); }
+  };
+  for (const t of stream.getTracks()) pc.addTrack(t, stream);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await post("offer", pc.localDescription);
+  setStatus("Offer sent — waiting for the venue to answer…", "warn", "wait");
+}
+
+// viewer said "ready" → (re)offer, unless we're already going or within the cooldown
+async function onReady() {
+  if (connected || (pc && pc.connectionState === "connecting")) return;
+  const now = Date.now();
+  if (now - lastOffer < OFFER_COOLDOWN_MS) return;
+  lastOffer = now;
+  try { await negotiate(); } catch (e) { setStatus("Negotiation error: " + (e.message || e), "err", "err"); }
+}
+
+async function handle(m) {
+  if (m.type === "ready") { await onReady(); }
+  else if (m.type === "answer") { if (pc && !pc.currentRemoteDescription) { try { await pc.setRemoteDescription(m.data); for (const c of pendingIce.splice(0)) { try { await pc.addIceCandidate(c); } catch (e) {} } } catch (e) {} } }
+  else if (m.type === "ice") { if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(m.data); } catch (e) {} } else pendingIce.push(m.data); }
+}
+
+async function pollOnce() {
+  if (!running) return;
+  const res = await inbox();
+  if (res && Array.isArray(res.messages)) { for (const m of res.messages) { await handle(m); since = m.seq; } }
+}
+function loop() { if (!running) return; pollOnce().finally(() => { if (running) pollT = setTimeout(loop, POLL_MS); }); }
+
+// ── SHARE ──
+shareBtn.addEventListener("click", async () => {
+  if (running) return;
+  setStatus("Requesting screen…", "", "wait");
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
+  } catch (e) {
+    setStatus("Screen share cancelled or blocked.", "warn", ""); stream = null; return;   // user cancelled the picker
+  }
+  running = true; since = 0; lastOffer = 0; connected = false; pendingIce.length = 0;
+  shareBtn.disabled = true; stopBtn.disabled = false;
+
+  // if the user stops sharing via the browser's own "Stop sharing" UI → tear down
+  stream.getVideoTracks().forEach((t) => { t.addEventListener("ended", stopSharing); });
+
+  await resetRoom();                          // clear any stale handshake so this session starts fresh
+  setStatus("Screen captured — waiting for the venue (open DESK mode on the headset)…", "", "wait");
+  loop();                                     // poll for the viewer's "ready", then offer
+});
+
+function stopSharing() {
+  if (!running && !stream) return;
+  running = false; connected = false;
+  if (pollT) { clearTimeout(pollT); pollT = null; }
+  if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+  if (stream) { try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {} stream = null; }
+  pendingIce.length = 0;
+  resetRoom();                                // clear the mailbox for the next session
+  shareBtn.disabled = false; stopBtn.disabled = true;
+  setStatus("Stopped. Click “Share Screen” to share again.", "", "");
+}
+stopBtn.addEventListener("click", stopSharing);
+
+// clean up if the tab closes
+window.addEventListener("beforeunload", () => { try { if (stream) stream.getTracks().forEach((t) => t.stop()); if (pc) pc.close(); } catch (e) {} });
+
+// getDisplayMedia requires a secure context (https or localhost/file). Warn early if unavailable.
+if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+  shareBtn.disabled = true;
+  setStatus("getDisplayMedia unavailable — open this page over http://localhost or https.", "err", "err");
+}
+</script>
+</body>
+</html>
