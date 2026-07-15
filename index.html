@@ -45,6 +45,12 @@
   .dot.err { background: #d65a5a; }
   .meta { margin-top: 14px; font-size: 11px; color: #557; }
   code { color: #9fd; background: #0c1a24; padding: 1px 5px; border-radius: 4px; }
+  .log {
+    margin-top: 12px; font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; color: #6fa88f;
+    text-align: left; max-height: 150px; overflow-y: auto; background: #08131b; border: 1px solid #12303a;
+    border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word;
+  }
+  .log:empty { display: none; }
 </style>
 </head>
 <body>
@@ -57,6 +63,7 @@
     </div>
     <div id="status" class="status"><span class="dot" id="dot"></span><span id="msg">Idle — click “Share Screen” to begin.</span></div>
     <div class="meta">room <code id="room">tulum-desk</code> · role <code>sharer</code> · signal <code id="base">…</code></div>
+    <div id="log" class="log"></div>
   </div>
 
 <script>
@@ -71,74 +78,126 @@ const OFFER_COOLDOWN_MS = 2000;     // don't re-offer more often than this on re
 
 // ── UI ──
 const $ = (id) => document.getElementById(id);
-const shareBtn = $("share"), stopBtn = $("stop"), msgEl = $("msg"), statusEl = $("status"), dotEl = $("dot");
+const shareBtn = $("share"), stopBtn = $("stop"), msgEl = $("msg"), statusEl = $("status"), dotEl = $("dot"), logEl = $("log");
 $("base").textContent = SIGNAL_BASE.replace("https://", "");
+const SHARE_URL = `${SIGNAL_BASE}/signal/${ROOM}/${ROLE}`;          // EXACT post target: …/signal/tulum-desk/sharer
 function setStatus(text, kind /* '', 'ok','err','warn' */, dot /* '', 'live','wait','err' */) {
   msgEl.textContent = text;
   statusEl.className = "status" + (kind ? " " + kind : "");
   dotEl.className = "dot" + (dot ? " " + dot : "");
 }
+const stamp = () => new Date().toLocaleTimeString();
+function logStep(text) {                                            // visible on-page step log (+ console)
+  console.log("[share] " + text);
+  if (!logEl) return;
+  const lines = (logEl.textContent ? logEl.textContent.split("\n") : []);
+  lines.push(`${stamp()}  ${text}`);
+  logEl.textContent = lines.slice(-14).join("\n");
+  logEl.scrollTop = logEl.scrollHeight;
+}
 
 // ── STATE ──
 let stream = null, pc = null, running = false, since = 0, pollT = null, lastOffer = 0, connected = false;
-const pendingIce = [];
+const pendingIce = [];   // INCOMING viewer ICE that arrived before we set the remote (answer) description
 
-// ── signaling helpers (async; swallow errors so the poll loop never dies) ──
+// ── signaling helpers ── every POST is CHECKED: returns {ok,status,seq,error}; failures are surfaced, never silent
 async function post(type, data) {
-  try { await fetch(`${SIGNAL_BASE}/signal/${ROOM}/${ROLE}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type, data: data ?? null }) }); }
-  catch (e) { /* keep going */ }
+  try {
+    const r = await fetch(SHARE_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type, data: data ?? null }) });
+    let body = null; try { body = await r.json(); } catch (e) { /* non-JSON */ }
+    return { ok: r.ok && (!body || body.ok !== false), status: r.status, seq: body && body.seq, body };
+  } catch (e) { return { ok: false, status: 0, error: e.message || String(e) }; }
 }
-async function resetRoom() { try { await fetch(`${SIGNAL_BASE}/signal/${ROOM}/reset`, { method: "POST" }); } catch (e) {} }
+async function resetRoom() {
+  try { const r = await fetch(`${SIGNAL_BASE}/signal/${ROOM}/reset`, { method: "POST" }); return r.ok; }
+  catch (e) { logStep(`reset FAILED: ${e.message || e}`); return false; }
+}
 async function inbox() {
   try { const r = await fetch(`${SIGNAL_BASE}/signal/${ROOM}/${ROLE}/inbox?since=${since}`); return r.ok ? await r.json() : null; }
   catch (e) { return null; }
 }
+async function postIce(candidate) {                                // full candidate object (viewer does addIceCandidate(data))
+  const r = await post("ice", candidate);
+  if (!r.ok) logStep(`ICE POST failed (HTTP ${r.status}${r.error ? ": " + r.error : ""})`);
+}
 
-// ── build a fresh peer connection with the display tracks + create/post an offer ──
+// ── build a fresh peer connection with the display tracks, then STRICT ORDER: createOffer → setLocalDescription →
+// POST offer (checked) → only then trickle ICE. ICE gathered before the offer lands is BUFFERED so the offer is
+// always the first sharer message (deterministic; not racing behind ICE). ──
 async function negotiate() {
   if (pc) { try { pc.close(); } catch (e) {} }
   connected = false;
+  let offerPosted = false; const outIce = [];                      // buffer outgoing ICE until the offer is posted
   pc = new RTCPeerConnection({ iceServers: ICE });
-  pc.onicecandidate = (e) => { if (e.candidate) post("ice", e.candidate.toJSON ? e.candidate.toJSON() : e.candidate); };
+  pc.onicecandidate = (e) => {
+    if (!e.candidate) return;
+    const c = e.candidate.toJSON ? e.candidate.toJSON() : e.candidate;
+    if (offerPosted) postIce(c); else outIce.push(c);              // hold until offer lands, then flush in order
+  };
   pc.onconnectionstatechange = () => {
     const st = pc.connectionState;
+    logStep(`pc.connectionState = ${st}`);
     if (st === "connected") { connected = true; const label = stream?.getVideoTracks?.()[0]?.label || "screen"; setStatus("Sharing — " + label, "ok", "live"); }
     else if (st === "connecting") { if (!connected) setStatus("Connecting to venue…", "warn", "wait"); }
     else if (st === "failed") { connected = false; setStatus("Connection failed — is the venue in DESK mode? Retrying…", "err", "err"); }
     else if (st === "disconnected") { connected = false; setStatus("Peer disconnected — waiting…", "warn", "wait"); }
   };
   for (const t of stream.getTracks()) pc.addTrack(t, stream);
+
+  logStep("createOffer…");
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  await post("offer", pc.localDescription);
+  logStep("setLocalDescription(offer) ok");
+  // data MUST be the full RTCSessionDescription {type,sdp} — the viewer does setRemoteDescription(data)
+  logStep(`POST ${SHARE_URL}  body={type:"offer",data:{type,sdp}}`);
+  const res = await post("offer", pc.localDescription);
+  if (!res.ok) {                                                   // FAIL LOUD — no fake "sent"
+    setStatus(`Offer POST FAILED — HTTP ${res.status}${res.error ? " (" + res.error + ")" : ""}. Check the signal URL/CORS.`, "err", "err");
+    logStep(`offer POST FAILED → HTTP ${res.status}${res.error ? " " + res.error : ""}`);
+    return;
+  }
+  offerPosted = true;
+  logStep(`offer POST ok → {ok:true, seq:${res.seq}} — offer is in the mailbox`);
   setStatus("Offer sent — waiting for the venue to answer…", "warn", "wait");
+  const buffered = outIce.length;                                 // now trickle the buffered ICE — offer-first ordering guaranteed
+  for (const c of outIce.splice(0)) await postIce(c);
+  logStep(`trickled ${buffered} buffered ICE candidate(s) (offer-first)`);
 }
 
 // viewer said "ready" → (re)offer, unless we're already going or within the cooldown
 async function onReady() {
-  if (connected || (pc && pc.connectionState === "connecting")) return;
+  if (connected || (pc && (pc.connectionState === "connecting" || pc.connectionState === "connected"))) return;
   const now = Date.now();
   if (now - lastOffer < OFFER_COOLDOWN_MS) return;
   lastOffer = now;
-  try { await negotiate(); } catch (e) { setStatus("Negotiation error: " + (e.message || e), "err", "err"); }
+  logStep('viewer "ready" received → negotiating');
+  try { await negotiate(); } catch (e) { setStatus("Negotiation error: " + (e.message || e), "err", "err"); logStep(`negotiate threw: ${e.message || e}`); }
 }
 
 async function handle(m) {
   if (m.type === "ready") { await onReady(); }
-  else if (m.type === "answer") { if (pc && !pc.currentRemoteDescription) { try { await pc.setRemoteDescription(m.data); for (const c of pendingIce.splice(0)) { try { await pc.addIceCandidate(c); } catch (e) {} } } catch (e) {} } }
-  else if (m.type === "ice") { if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(m.data); } catch (e) {} } else pendingIce.push(m.data); }
+  else if (m.type === "answer") {
+    if (pc && !pc.currentRemoteDescription) {
+      try { await pc.setRemoteDescription(m.data); logStep("answer received → setRemoteDescription ok"); for (const c of pendingIce.splice(0)) { try { await pc.addIceCandidate(c); } catch (e) {} } }
+      catch (e) { logStep(`setRemoteDescription(answer) err: ${e.message || e}`); }
+    }
+  } else if (m.type === "ice") {                                  // viewer's ICE — apply after we have the answer, else queue
+    if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(m.data); } catch (e) {} }
+    else pendingIce.push(m.data);
+  }
 }
 
 async function pollOnce() {
   if (!running) return;
   const res = await inbox();
-  if (res && Array.isArray(res.messages)) { for (const m of res.messages) { await handle(m); since = m.seq; } }
+  if (res && Array.isArray(res.messages)) { for (const m of res.messages) { await handle(m); since = m.seq; } }   // ALL messages, in order
 }
 function loop() { if (!running) return; pollOnce().finally(() => { if (running) pollT = setTimeout(loop, POLL_MS); }); }
 
 // ── SHARE ──
 shareBtn.addEventListener("click", async () => {
   if (running) return;
+  logEl.textContent = "";
   setStatus("Requesting screen…", "", "wait");
   try {
     stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
@@ -147,11 +206,13 @@ shareBtn.addEventListener("click", async () => {
   }
   running = true; since = 0; lastOffer = 0; connected = false; pendingIce.length = 0;
   shareBtn.disabled = true; stopBtn.disabled = false;
+  logStep(`screen captured (${stream.getVideoTracks()[0]?.label || "screen"})`);
 
   // if the user stops sharing via the browser's own "Stop sharing" UI → tear down
   stream.getVideoTracks().forEach((t) => { t.addEventListener("ended", stopSharing); });
 
-  await resetRoom();                          // clear any stale handshake so this session starts fresh
+  const ok = await resetRoom();                          // clear any stale handshake so this session starts fresh
+  logStep(`room /reset ${ok ? "ok" : "failed"}`);
   setStatus("Screen captured — waiting for the venue (open DESK mode on the headset)…", "", "wait");
   loop();                                     // poll for the viewer's "ready", then offer
 });
@@ -166,6 +227,7 @@ function stopSharing() {
   resetRoom();                                // clear the mailbox for the next session
   shareBtn.disabled = false; stopBtn.disabled = true;
   setStatus("Stopped. Click “Share Screen” to share again.", "", "");
+  logStep("stopped — pc closed, tracks stopped, room reset");
 }
 stopBtn.addEventListener("click", stopSharing);
 
