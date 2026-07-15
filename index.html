@@ -73,8 +73,13 @@ const SIGNAL_BASE = "https://tulum-desk-signal.hartwell.workers.dev";
 const ROOM = "tulum-desk";          // fixed shared room code (auto-pair, no pin)
 const ROLE = "sharer";              // this page; the venue is "viewer"
 const ICE  = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
-const POLL_MS = 700;
-const OFFER_COOLDOWN_MS = 2000;     // don't re-offer more often than this on repeated viewer "ready"
+const POLL_MS = 700;                // inbox poll cadence DURING the connect handshake only
+// give up (stop polling) if not connected within this window. Default 45s; overridable via ?connectTimeoutMs= for testing.
+const CONNECT_TIMEOUT_MS = (function () { const m = /[?&]connectTimeoutMs=(\d+)/.exec(location.search); return m ? +m[1] : 45000; })();
+// POLL LIFECYCLE (KV-read discipline): polling STARTS only AFTER the offer is posted; STOPS on pc
+// "connected"/"completed", on the 45s connect timeout, and on Stop / track-ended / page-unload. It NEVER polls
+// before the offer and NEVER polls after the peer connects — the video is pure P2P then, so zero further reads.
+console.info('[share] poll lifecycle — START: after offer posted. STOP: pc connected|completed, ' + (CONNECT_TIMEOUT_MS / 1000) + 's timeout, Stop/ended/unload. No pre-offer polling, no post-connect polling.');
 
 // ── UI ──
 const $ = (id) => document.getElementById(id);
@@ -97,7 +102,8 @@ function logStep(text) {                                            // visible o
 }
 
 // ── STATE ──
-let stream = null, pc = null, running = false, since = 0, pollT = null, lastOffer = 0, connected = false;
+let stream = null, pc = null, running = false, polling = false, since = 0, connected = false;
+let pollT = null, connectTimeoutT = null;
 const pendingIce = [];   // INCOMING viewer ICE that arrived before we set the remote (answer) description
 
 // ── signaling helpers ── every POST is CHECKED: returns {ok,status,seq,error}; failures are surfaced, never silent
@@ -129,18 +135,25 @@ async function negotiate() {
   connected = false;
   let offerPosted = false; const outIce = [];                      // buffer outgoing ICE until the offer is posted
   pc = new RTCPeerConnection({ iceServers: ICE });
+  const thePc = pc;                                                // guard against a stale handler after teardown/renegotiate
   pc.onicecandidate = (e) => {
     if (!e.candidate) return;
     const c = e.candidate.toJSON ? e.candidate.toJSON() : e.candidate;
     if (offerPosted) postIce(c); else outIce.push(c);              // hold until offer lands, then flush in order
   };
   pc.onconnectionstatechange = () => {
-    const st = pc.connectionState;
+    if (pc !== thePc) return;
+    const st = thePc.connectionState;
     logStep(`pc.connectionState = ${st}`);
-    if (st === "connected") { connected = true; const label = stream?.getVideoTracks?.()[0]?.label || "screen"; setStatus("Sharing — " + label, "ok", "live"); }
+    if (st === "connected" || st === "completed") markConnected();
     else if (st === "connecting") { if (!connected) setStatus("Connecting to venue…", "warn", "wait"); }
-    else if (st === "failed") { connected = false; setStatus("Connection failed — is the venue in DESK mode? Retrying…", "err", "err"); }
-    else if (st === "disconnected") { connected = false; setStatus("Peer disconnected — waiting…", "warn", "wait"); }
+    else if (st === "failed") { teardown("Connection failed — click Share Screen to retry.", "err", "err", "pc connectionState=failed"); }
+    else if (st === "disconnected") { if (!connected) setStatus("Connection interrupted — click Share Screen to retry.", "warn", "wait"); else setStatus("Peer disconnected.", "warn", "wait"); }
+  };
+  pc.oniceconnectionstatechange = () => {                          // some setups report ICE connected before connectionState
+    if (pc !== thePc) return;
+    const s = thePc.iceConnectionState;
+    if (s === "connected" || s === "completed") markConnected();
   };
   for (const t of stream.getTracks()) pc.addTrack(t, stream);
 
@@ -154,7 +167,7 @@ async function negotiate() {
   if (!res.ok) {                                                   // FAIL LOUD — no fake "sent"
     setStatus(`Offer POST FAILED — HTTP ${res.status}${res.error ? " (" + res.error + ")" : ""}. Check the signal URL/CORS.`, "err", "err");
     logStep(`offer POST FAILED → HTTP ${res.status}${res.error ? " " + res.error : ""}`);
-    return;
+    return false;
   }
   offerPosted = true;
   logStep(`offer POST ok → {ok:true, seq:${res.seq}} — offer is in the mailbox`);
@@ -162,21 +175,14 @@ async function negotiate() {
   const buffered = outIce.length;                                 // now trickle the buffered ICE — offer-first ordering guaranteed
   for (const c of outIce.splice(0)) await postIce(c);
   logStep(`trickled ${buffered} buffered ICE candidate(s) (offer-first)`);
+  return true;
 }
 
-// viewer said "ready" → (re)offer, unless we're already going or within the cooldown
-async function onReady() {
-  if (connected || (pc && (pc.connectionState === "connecting" || pc.connectionState === "connected"))) return;
-  const now = Date.now();
-  if (now - lastOffer < OFFER_COOLDOWN_MS) return;
-  lastOffer = now;
-  logStep('viewer "ready" received → negotiating');
-  try { await negotiate(); } catch (e) { setStatus("Negotiation error: " + (e.message || e), "err", "err"); logStep(`negotiate threw: ${e.message || e}`); }
-}
-
+// The venue viewer reads our offer from the mailbox (reset-safe, from seq 0) and answers + trickles ICE. We only
+// need to process those. "ready" is ignored — we post the offer PROACTIVELY (so polling starts after the offer),
+// so we never need a "ready" to trigger it.
 async function handle(m) {
-  if (m.type === "ready") { await onReady(); }
-  else if (m.type === "answer") {
+  if (m.type === "answer") {
     if (pc && !pc.currentRemoteDescription) {
       try { await pc.setRemoteDescription(m.data); logStep("answer received → setRemoteDescription ok"); for (const c of pendingIce.splice(0)) { try { await pc.addIceCandidate(c); } catch (e) {} } }
       catch (e) { logStep(`setRemoteDescription(answer) err: ${e.message || e}`); }
@@ -187,12 +193,41 @@ async function handle(m) {
   }
 }
 
+// ── POLLING DISCIPLINE ── inbox is polled ONLY during the connect window (after the offer, until connected/timeout)
+function markConnected() {
+  if (connected) return;
+  connected = true;
+  stopPolling("pc connected — P2P live, ZERO further signaling");
+  const label = stream && stream.getVideoTracks && stream.getVideoTracks()[0] ? stream.getVideoTracks()[0].label : "screen";
+  setStatus("Sharing — " + label, "ok", "live");
+}
+function startPolling() {
+  if (polling) return;
+  polling = true; since = 0;
+  logStep(`polling STARTED — inbox @${POLL_MS}ms, ${CONNECT_TIMEOUT_MS / 1000}s connect timeout (offer already posted)`);
+  connectTimeoutT = setTimeout(onConnectTimeout, CONNECT_TIMEOUT_MS);
+  loop();
+}
+function stopPolling(reason) {
+  const was = polling || pollT || connectTimeoutT;
+  polling = false;
+  if (pollT) { clearTimeout(pollT); pollT = null; }
+  if (connectTimeoutT) { clearTimeout(connectTimeoutT); connectTimeoutT = null; }
+  if (was) logStep(`polling STOPPED — ${reason}`);
+}
+function onConnectTimeout() {
+  connectTimeoutT = null;
+  if (connected) return;
+  logStep(`CONNECT TIMEOUT (${CONNECT_TIMEOUT_MS / 1000}s) — no connection; giving up`);
+  teardown("Connection timed out — click Share Screen to retry.", "err", "err", `${CONNECT_TIMEOUT_MS / 1000}s connect timeout`);
+}
 async function pollOnce() {
-  if (!running) return;
+  if (!polling) return;
   const res = await inbox();
+  if (!polling) return;                                           // may have connected/stopped during the await
   if (res && Array.isArray(res.messages)) { for (const m of res.messages) { await handle(m); since = m.seq; } }   // ALL messages, in order
 }
-function loop() { if (!running) return; pollOnce().finally(() => { if (running) pollT = setTimeout(loop, POLL_MS); }); }
+function loop() { if (!polling) return; pollOnce().finally(() => { if (polling) pollT = setTimeout(loop, POLL_MS); }); }
 
 // ── SHARE ──
 shareBtn.addEventListener("click", async () => {
@@ -204,35 +239,51 @@ shareBtn.addEventListener("click", async () => {
   } catch (e) {
     setStatus("Screen share cancelled or blocked.", "warn", ""); stream = null; return;   // user cancelled the picker
   }
-  running = true; since = 0; lastOffer = 0; connected = false; pendingIce.length = 0;
+  running = true; connected = false; since = 0; pendingIce.length = 0;
   shareBtn.disabled = true; stopBtn.disabled = false;
   logStep(`screen captured (${stream.getVideoTracks()[0]?.label || "screen"})`);
 
   // if the user stops sharing via the browser's own "Stop sharing" UI → tear down
-  stream.getVideoTracks().forEach((t) => { t.addEventListener("ended", stopSharing); });
+  stream.getVideoTracks().forEach((t) => { t.addEventListener("ended", onTrackEnded); });
 
   const ok = await resetRoom();                          // clear any stale handshake so this session starts fresh
   logStep(`room /reset ${ok ? "ok" : "failed"}`);
-  setStatus("Screen captured — waiting for the venue (open DESK mode on the headset)…", "", "wait");
-  loop();                                     // poll for the viewer's "ready", then offer
+  if (!running) return;                                  // user hit Stop during the reset await
+
+  // POST THE OFFER FIRST (proactive — the viewer reads it from the mailbox), THEN start polling for the answer.
+  // No pre-offer idle polling; polling begins only once the offer is in the mailbox.
+  const posted = await negotiate();
+  if (!running) return;                                  // stopped mid-negotiate
+  if (!posted) { teardown(null, "", "", "offer POST failed"); return; }   // keep the offer-error status; re-enable Share
+
+  startPolling();
 });
 
-function stopSharing() {
-  if (!running && !stream) return;
+// Full teardown: stop polling + clear the connect timeout, close the pc, stop tracks, reset the room, re-enable
+// Share. Used by Stop, the connect timeout, offer failure, and a hard pc failure. `msg===null` keeps the status.
+function teardown(msg, kind, dot, reason) {
+  const wasActive = running || polling || pc || stream;
   running = false; connected = false;
-  if (pollT) { clearTimeout(pollT); pollT = null; }
+  stopPolling(reason || "teardown");
   if (pc) { try { pc.close(); } catch (e) {} pc = null; }
   if (stream) { try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {} stream = null; }
   pendingIce.length = 0;
-  resetRoom();                                // clear the mailbox for the next session
+  if (wasActive) resetRoom();                            // clear the mailbox for the next session
   shareBtn.disabled = false; stopBtn.disabled = true;
-  setStatus("Stopped. Click “Share Screen” to share again.", "", "");
-  logStep("stopped — pc closed, tracks stopped, room reset");
+  if (msg !== undefined && msg !== null) setStatus(msg, kind || "", dot || "");
 }
+
+function stopSharing() { teardown("Stopped. Click “Share Screen” to share again.", "", "", "Stop clicked"); }
+function onTrackEnded() { teardown("Screen sharing ended. Click “Share Screen” to share again.", "", "", "screen-share track ended"); }
 stopBtn.addEventListener("click", stopSharing);
 
-// clean up if the tab closes
-window.addEventListener("beforeunload", () => { try { if (stream) stream.getTracks().forEach((t) => t.stop()); if (pc) pc.close(); } catch (e) {} });
+// clean up if the tab closes — stop polling, close the pc, stop tracks, best-effort reset (fire-and-forget beacon)
+window.addEventListener("beforeunload", () => {
+  stopPolling("page unload");
+  try { if (stream) stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+  try { if (pc) pc.close(); } catch (e) {}
+  try { if (navigator.sendBeacon) navigator.sendBeacon(`${SIGNAL_BASE}/signal/${ROOM}/reset`); } catch (e) {}
+});
 
 // getDisplayMedia requires a secure context (https or localhost/file). Warn early if unavailable.
 if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
