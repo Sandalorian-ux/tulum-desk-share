@@ -71,19 +71,17 @@
       <button id="modeVideo" type="button">VIDEO</button>
     </div>
     <div id="status" class="status"><span class="dot" id="dot"></span><span id="msg">Idle — click “Share Screen” to begin.</span></div>
-    <div class="meta">room <code id="room">tulum-desk</code> · role <code>sharer</code> · signal <code id="base">…</code></div>
+    <div class="meta">role <code>sharer</code> · signal <code id="base">…</code></div>
     <div class="meta" id="quality">capture — · sender cap —</div>
     <div id="log" class="log"></div>
   </div>
 
 <script>
 "use strict";
-// ── SIGNALING CONFIG (the fixed-room mailbox Worker — already live) ──
-const SIGNAL_BASE = "https://tulum-desk-signal.hartwell.workers.dev";
-const ROOM = "tulum-desk";          // fixed shared room code (auto-pair, no pin)
+// ── SIGNALING CONFIG (persistent WS relay — replaces the old KV-poll Worker; do NOT rebuild) ──
+const WS_URL = "wss://desk-signal.saturo-tulum.com";
 const ROLE = "sharer";              // this page; the venue is "viewer"
 const ICE  = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
-const POLL_MS = 700;                // inbox poll cadence DURING the connect handshake only
 // TEXT/VIDEO QUALITY PROFILES (LAN, bandwidth not a constraint). TEXT (default) favors sharpness for reading
 // terminals/pages: low framerate, maintain-resolution. VIDEO favors smooth motion: higher framerate,
 // maintain-framerate. Capture resolution (2560x1440 ideal) is shared by both; only framerate/encoding differ.
@@ -100,19 +98,18 @@ const PROFILES = {
   },
 };
 let mode = "text";                       // active profile key; toggled live via the TEXT/VIDEO buttons
-// give up (stop polling) if not connected within this window. Default 45s; overridable via ?connectTimeoutMs= for testing.
+// give up (close the socket) if not connected within this window. Default 45s; overridable via ?connectTimeoutMs= for testing.
 const CONNECT_TIMEOUT_MS = (function () { const m = /[?&]connectTimeoutMs=(\d+)/.exec(location.search); return m ? +m[1] : 45000; })();
-// POLL LIFECYCLE (KV-read discipline): polling STARTS only AFTER the offer is posted; STOPS on pc
-// "connected"/"completed", on the 45s connect timeout, and on Stop / track-ended / page-unload. It NEVER polls
-// before the offer and NEVER polls after the peer connects — the video is pure P2P then, so zero further reads.
-console.info('[share] poll lifecycle — START: after offer posted. STOP: pc connected|completed, ' + (CONNECT_TIMEOUT_MS / 1000) + 's timeout, Stop/ended/unload. No pre-offer polling, no post-connect polling.');
+// SIGNALING LIFECYCLE: the WebSocket opens on Share Screen (hello → offer → trickle ICE), the connect-timeout
+// window starts once the offer is sent, and stops on pc "connected"/"completed" (socket closed — video is P2P,
+// zero further signaling), on the 45s connect timeout, or on Stop/track-ended/unload. No polling anywhere.
+console.info(`[share] signaling lifecycle — WS opens on Share Screen, offer sent immediately, ${CONNECT_TIMEOUT_MS / 1000}s connect timeout, socket closes on connected/timeout/Stop/ended/unload.`);
 
 // ── UI ──
 const $ = (id) => document.getElementById(id);
 const shareBtn = $("share"), stopBtn = $("stop"), msgEl = $("msg"), statusEl = $("status"), dotEl = $("dot"), logEl = $("log"), qualityEl = $("quality");
 const modeTextBtn = $("modeText"), modeVideoBtn = $("modeVideo");
-$("base").textContent = SIGNAL_BASE.replace("https://", "");
-const SHARE_URL = `${SIGNAL_BASE}/signal/${ROOM}/${ROLE}`;          // EXACT post target: …/signal/tulum-desk/sharer
+$("base").textContent = WS_URL.replace("wss://", "");
 function setStatus(text, kind /* '', 'ok','err','warn' */, dot /* '', 'live','wait','err' */) {
   msgEl.textContent = text;
   statusEl.className = "status" + (kind ? " " + kind : "");
@@ -129,30 +126,11 @@ function logStep(text) {                                            // visible o
 }
 
 // ── STATE ──
-let stream = null, pc = null, running = false, polling = false, since = 0, connected = false;
-let pollT = null, connectTimeoutT = null;
+let stream = null, pc = null, ws = null, running = false, connected = false, connectTimeoutT = null;
 const pendingIce = [];   // INCOMING viewer ICE that arrived before we set the remote (answer) description
 
-// ── signaling helpers ── every POST is CHECKED: returns {ok,status,seq,error}; failures are surfaced, never silent
-async function post(type, data) {
-  try {
-    const r = await fetch(SHARE_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type, data: data ?? null }) });
-    let body = null; try { body = await r.json(); } catch (e) { /* non-JSON */ }
-    return { ok: r.ok && (!body || body.ok !== false), status: r.status, seq: body && body.seq, body };
-  } catch (e) { return { ok: false, status: 0, error: e.message || String(e) }; }
-}
-async function resetRoom() {
-  try { const r = await fetch(`${SIGNAL_BASE}/signal/${ROOM}/reset`, { method: "POST" }); return r.ok; }
-  catch (e) { logStep(`reset FAILED: ${e.message || e}`); return false; }
-}
-async function inbox() {
-  try { const r = await fetch(`${SIGNAL_BASE}/signal/${ROOM}/${ROLE}/inbox?since=${since}`); return r.ok ? await r.json() : null; }
-  catch (e) { return null; }
-}
-async function postIce(candidate) {                                // full candidate object (viewer does addIceCandidate(data))
-  const r = await post("ice", candidate);
-  if (!r.ok) logStep(`ICE POST failed (HTTP ${r.status}${r.error ? ": " + r.error : ""})`);
-}
+// ── signaling: one persistent WS per Share session; every send is guarded, never throws ──
+function wsSend(type, data) { try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, data: data ?? null })); } catch (e) { /* socket gone */ } }
 
 // apply a profile's bitrate/framerate cap to a sender (guarded: encodings[] may be empty pre-negotiation; never throws).
 async function applyEncodingParams(sender, profile) {
@@ -196,18 +174,18 @@ async function applyProfile(newMode) {
 }
 
 // ── build a fresh peer connection with the display tracks, then STRICT ORDER: createOffer → setLocalDescription →
-// POST offer (checked) → only then trickle ICE. ICE gathered before the offer lands is BUFFERED so the offer is
+// WS send offer (checked) → only then trickle ICE. ICE gathered before the offer lands is BUFFERED so the offer is
 // always the first sharer message (deterministic; not racing behind ICE). ──
 async function negotiate() {
   if (pc) { try { pc.close(); } catch (e) {} }
   connected = false;
-  let offerPosted = false; const outIce = [];                      // buffer outgoing ICE until the offer is posted
+  let offerSent = false; const outIce = [];                        // buffer outgoing ICE until the offer is sent
   pc = new RTCPeerConnection({ iceServers: ICE });
   const thePc = pc;                                                // guard against a stale handler after teardown/renegotiate
   pc.onicecandidate = (e) => {
     if (!e.candidate) return;
     const c = e.candidate.toJSON ? e.candidate.toJSON() : e.candidate;
-    if (offerPosted) postIce(c); else outIce.push(c);              // hold until offer lands, then flush in order
+    if (offerSent) wsSend("ice", c); else outIce.push(c);          // hold until offer lands, then flush in order
   };
   pc.onconnectionstatechange = () => {
     if (pc !== thePc) return;
@@ -231,25 +209,24 @@ async function negotiate() {
   logStep("setLocalDescription(offer) ok");
   for (const s of senders) await applyEncodingParams(s, PROFILES[mode]);   // apply the active profile now senders/encodings exist
   // data MUST be the full RTCSessionDescription {type,sdp} — the viewer does setRemoteDescription(data)
-  logStep(`POST ${SHARE_URL}  body={type:"offer",data:{type,sdp}}`);
-  const res = await post("offer", pc.localDescription);
-  if (!res.ok) {                                                   // FAIL LOUD — no fake "sent"
-    setStatus(`Offer POST FAILED — HTTP ${res.status}${res.error ? " (" + res.error + ")" : ""}. Check the signal URL/CORS.`, "err", "err");
-    logStep(`offer POST FAILED → HTTP ${res.status}${res.error ? " " + res.error : ""}`);
+  if (!ws || ws.readyState !== WebSocket.OPEN) {                   // FAIL LOUD — no fake "sent"
+    setStatus("Offer send FAILED — signaling socket not open.", "err", "err");
+    logStep("offer send FAILED — ws not open");
     return false;
   }
-  offerPosted = true;
-  logStep(`offer POST ok → {ok:true, seq:${res.seq}} — offer is in the mailbox`);
+  logStep(`WS send offer → {type:"offer",data:{type,sdp}}`);
+  wsSend("offer", pc.localDescription);
+  offerSent = true;
+  logStep("offer sent — relay will forward it to the venue");
   setStatus("Offer sent — waiting for the venue to answer…", "warn", "wait");
   const buffered = outIce.length;                                 // now trickle the buffered ICE — offer-first ordering guaranteed
-  for (const c of outIce.splice(0)) await postIce(c);
+  for (const c of outIce.splice(0)) wsSend("ice", c);
   logStep(`trickled ${buffered} buffered ICE candidate(s) (offer-first)`);
   return true;
 }
 
-// The venue viewer reads our offer from the mailbox (reset-safe, from seq 0) and answers + trickles ICE. We only
-// need to process those. "ready" is ignored — we post the offer PROACTIVELY (so polling starts after the offer),
-// so we never need a "ready" to trigger it.
+// The relay forwards the venue's answer + trickled ICE straight to us over the same socket. We post the offer
+// PROACTIVELY on open, so there's no "ready" handshake to wait for.
 async function handle(m) {
   if (m.type === "answer") {
     if (pc && !pc.currentRemoteDescription) {
@@ -259,30 +236,26 @@ async function handle(m) {
   } else if (m.type === "ice") {                                  // viewer's ICE — apply after we have the answer, else queue
     if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(m.data); } catch (e) {} }
     else pendingIce.push(m.data);
+  } else if (m.type === "peer-left") {
+    logStep("peer-left received (venue viewer disconnected)");
   }
 }
 
-// ── POLLING DISCIPLINE ── inbox is polled ONLY during the connect window (after the offer, until connected/timeout)
+// ── SIGNALING LIFECYCLE ── the socket is only open while a Share session is active; it closes on connect, on the
+// 45s connect timeout, and on Stop/track-ended/unload. No polling anywhere.
 function markConnected() {
   if (connected) return;
   connected = true;
-  stopPolling("pc connected — P2P live, ZERO further signaling");
+  if (connectTimeoutT) { clearTimeout(connectTimeoutT); connectTimeoutT = null; }
+  closeSocket();                                                   // P2P live now — ZERO further signaling needed
+  logStep("pc connected — P2P live, signaling socket closed");
   const label = stream && stream.getVideoTracks && stream.getVideoTracks()[0] ? stream.getVideoTracks()[0].label : "screen";
   setStatus("Sharing — " + label, "ok", "live");
 }
-function startPolling() {
-  if (polling) return;
-  polling = true; since = 0;
-  logStep(`polling STARTED — inbox @${POLL_MS}ms, ${CONNECT_TIMEOUT_MS / 1000}s connect timeout (offer already posted)`);
-  connectTimeoutT = setTimeout(onConnectTimeout, CONNECT_TIMEOUT_MS);
-  loop();
-}
-function stopPolling(reason) {
-  const was = polling || pollT || connectTimeoutT;
-  polling = false;
-  if (pollT) { clearTimeout(pollT); pollT = null; }
-  if (connectTimeoutT) { clearTimeout(connectTimeoutT); connectTimeoutT = null; }
-  if (was) logStep(`polling STOPPED — ${reason}`);
+function closeSocket() {
+  if (!ws) return;
+  try { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; ws.close(); } catch (e) {}
+  ws = null;
 }
 function onConnectTimeout() {
   connectTimeoutT = null;
@@ -290,13 +263,27 @@ function onConnectTimeout() {
   logStep(`CONNECT TIMEOUT (${CONNECT_TIMEOUT_MS / 1000}s) — no connection; giving up`);
   teardown("Connection timed out — click Share Screen to retry.", "err", "err", `${CONNECT_TIMEOUT_MS / 1000}s connect timeout`);
 }
-async function pollOnce() {
-  if (!polling) return;
-  const res = await inbox();
-  if (!polling) return;                                           // may have connected/stopped during the await
-  if (res && Array.isArray(res.messages)) { for (const m of res.messages) { await handle(m); since = m.seq; } }   // ALL messages, in order
+// open the signaling WS, send hello once open, and wire message/close handling for the rest of the session.
+// Resolves true once open (and hello sent), false if construction/connection fails before opening.
+function openSocket() {
+  return new Promise((resolve) => {
+    let settled = false;
+    try { ws = new WebSocket(WS_URL); }
+    catch (e) { logStep(`WebSocket construction failed: ${e.message || e}`); resolve(false); return; }
+    ws.onopen = () => {
+      logStep(`ws open → ${WS_URL}, sending hello (role ${ROLE})`);
+      try { ws.send(JSON.stringify({ type: "hello", role: ROLE })); } catch (e) {}
+      settled = true; resolve(true);
+    };
+    ws.onmessage = (e) => { let msg; try { msg = JSON.parse(e.data); } catch (err) { return; } handle(msg); };
+    ws.onclose = () => {
+      logStep("ws closed");
+      if (!settled) { settled = true; resolve(false); return; }     // failed to open at all
+      if (running) teardown("Signaling connection lost — click Share Screen to retry.", "err", "err", "ws closed unexpectedly");
+    };
+    ws.onerror = () => { logStep("ws error"); };
+  });
 }
-function loop() { if (!polling) return; pollOnce().finally(() => { if (polling) pollT = setTimeout(loop, POLL_MS); }); }
 
 // ── SHARE ──
 shareBtn.addEventListener("click", async () => {
@@ -314,7 +301,7 @@ shareBtn.addEventListener("click", async () => {
   } catch (e) {
     setStatus("Screen share cancelled or blocked.", "warn", ""); stream = null; return;   // user cancelled the picker
   }
-  running = true; connected = false; since = 0; pendingIce.length = 0;
+  running = true; connected = false; pendingIce.length = 0;
   shareBtn.disabled = true; stopBtn.disabled = false;
   logStep(`screen captured (${stream.getVideoTracks()[0]?.label || "screen"})`);
   await applyProfile(mode);                              // contentHint + frameRate for the active mode (default TEXT)
@@ -322,32 +309,34 @@ shareBtn.addEventListener("click", async () => {
   // if the user stops sharing via the browser's own "Stop sharing" UI → tear down
   stream.getVideoTracks().forEach((t) => { t.addEventListener("ended", onTrackEnded); });
 
-  const ok = await resetRoom();                          // clear any stale handshake so this session starts fresh
-  logStep(`room /reset ${ok ? "ok" : "failed"}`);
-  if (!running) return;                                  // user hit Stop during the reset await
+  setStatus("Connecting to signaling relay…", "warn", "wait");
+  const opened = await openSocket();
+  if (!running) return;                                  // user hit Stop during the socket-open await
+  if (!opened) { teardown("Signaling socket FAILED to open — check desk-signal.saturo-tulum.com.", "err", "err", "ws failed to open"); return; }
 
-  // POST THE OFFER FIRST (proactive — the viewer reads it from the mailbox), THEN start polling for the answer.
-  // No pre-offer idle polling; polling begins only once the offer is in the mailbox.
+  // SEND THE OFFER FIRST (proactive — the relay forwards it to the venue immediately), then arm the connect timeout.
   const posted = await negotiate();
   if (!running) return;                                  // stopped mid-negotiate
-  if (!posted) { teardown(null, "", "", "offer POST failed"); return; }   // keep the offer-error status; re-enable Share
+  if (!posted) { teardown(null, "", "", "offer send failed"); return; }   // keep the offer-error status; re-enable Share
 
-  startPolling();
+  connectTimeoutT = setTimeout(onConnectTimeout, CONNECT_TIMEOUT_MS);
+  logStep(`connect timeout armed — ${CONNECT_TIMEOUT_MS / 1000}s`);
 });
 
-// Full teardown: stop polling + clear the connect timeout, close the pc, stop tracks, reset the room, re-enable
-// Share. Used by Stop, the connect timeout, offer failure, and a hard pc failure. `msg===null` keeps the status.
+// Full teardown: clear the connect timeout, close the socket + pc, stop tracks, re-enable Share. Used by Stop, the
+// connect timeout, socket/offer failure, and a hard pc failure. `msg===null` keeps the status.
 function teardown(msg, kind, dot, reason) {
-  const wasActive = running || polling || pc || stream;
+  const wasActive = running || ws || pc || stream;
   running = false; connected = false;
-  stopPolling(reason || "teardown");
+  if (connectTimeoutT) { clearTimeout(connectTimeoutT); connectTimeoutT = null; }
+  closeSocket();
   if (pc) { try { pc.close(); } catch (e) {} pc = null; }
   if (stream) { try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {} stream = null; }
   pendingIce.length = 0;
-  if (wasActive) resetRoom();                            // clear the mailbox for the next session
   shareBtn.disabled = false; stopBtn.disabled = true;
   if (msg !== undefined && msg !== null) setStatus(msg, kind || "", dot || "");
   updateQualityInfo(null, PROFILES[mode]);
+  if (wasActive) logStep(`teardown — ${reason || "teardown"}`);
 }
 
 function stopSharing() { teardown("Stopped. Click “Share Screen” to share again.", "", "", "Stop clicked"); }
@@ -360,12 +349,11 @@ modeVideoBtn.addEventListener("click", () => applyProfile("video"));
 updateModeButtons();
 updateQualityInfo(null, PROFILES[mode]);   // initial idle reading
 
-// clean up if the tab closes — stop polling, close the pc, stop tracks, best-effort reset (fire-and-forget beacon)
+// clean up if the tab closes — close the socket, close the pc, stop tracks
 window.addEventListener("beforeunload", () => {
-  stopPolling("page unload");
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch (e) {}
   try { if (stream) stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
   try { if (pc) pc.close(); } catch (e) {}
-  try { if (navigator.sendBeacon) navigator.sendBeacon(`${SIGNAL_BASE}/signal/${ROOM}/reset`); } catch (e) {}
 });
 
 // getDisplayMedia requires a secure context (https or localhost/file). Warn early if unavailable.
