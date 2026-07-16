@@ -63,6 +63,7 @@
     </div>
     <div id="status" class="status"><span class="dot" id="dot"></span><span id="msg">Idle — click “Share Screen” to begin.</span></div>
     <div class="meta">room <code id="room">tulum-desk</code> · role <code>sharer</code> · signal <code id="base">…</code></div>
+    <div class="meta" id="quality">capture — · sender cap —</div>
     <div id="log" class="log"></div>
   </div>
 
@@ -74,6 +75,13 @@ const ROOM = "tulum-desk";          // fixed shared room code (auto-pair, no pin
 const ROLE = "sharer";              // this page; the venue is "viewer"
 const ICE  = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
 const POLL_MS = 700;                // inbox poll cadence DURING the connect handshake only
+// TEXT-SHARPNESS TUNING (LAN, bandwidth not a constraint): capture is high-res/low-framerate (static text
+// reads better than smooth motion here), and the sender's bitrate cap is raised so the encoder never has to
+// trade sharpness for bitrate at 1080p+. degradationPreference keeps resolution over framerate under load.
+const CAPTURE_WIDTH_IDEAL = 2560, CAPTURE_HEIGHT_IDEAL = 1440;
+const CAPTURE_FRAMERATE_IDEAL = 15, CAPTURE_FRAMERATE_MAX = 30;
+const SENDER_MAX_BITRATE = 10_000_000;   // bps — crisp 1080p+ text over LAN
+const SENDER_MAX_FRAMERATE = 30;
 // give up (stop polling) if not connected within this window. Default 45s; overridable via ?connectTimeoutMs= for testing.
 const CONNECT_TIMEOUT_MS = (function () { const m = /[?&]connectTimeoutMs=(\d+)/.exec(location.search); return m ? +m[1] : 45000; })();
 // POLL LIFECYCLE (KV-read discipline): polling STARTS only AFTER the offer is posted; STOPS on pc
@@ -83,7 +91,7 @@ console.info('[share] poll lifecycle — START: after offer posted. STOP: pc con
 
 // ── UI ──
 const $ = (id) => document.getElementById(id);
-const shareBtn = $("share"), stopBtn = $("stop"), msgEl = $("msg"), statusEl = $("status"), dotEl = $("dot"), logEl = $("log");
+const shareBtn = $("share"), stopBtn = $("stop"), msgEl = $("msg"), statusEl = $("status"), dotEl = $("dot"), logEl = $("log"), qualityEl = $("quality");
 $("base").textContent = SIGNAL_BASE.replace("https://", "");
 const SHARE_URL = `${SIGNAL_BASE}/signal/${ROOM}/${ROLE}`;          // EXACT post target: …/signal/tulum-desk/sharer
 function setStatus(text, kind /* '', 'ok','err','warn' */, dot /* '', 'live','wait','err' */) {
@@ -127,6 +135,26 @@ async function postIce(candidate) {                                // full candi
   if (!r.ok) logStep(`ICE POST failed (HTTP ${r.status}${r.error ? ": " + r.error : ""})`);
 }
 
+// raise the video sender's bitrate cap for crisp text (guarded: encodings[] may be empty pre-negotiation).
+async function applyEncodingParams(sender) {
+  if (!sender || !sender.track || sender.track.kind !== "video") return;
+  try {
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+    params.encodings[0].maxBitrate = SENDER_MAX_BITRATE;
+    params.encodings[0].maxFramerate = SENDER_MAX_FRAMERATE;
+    params.degradationPreference = "maintain-resolution";         // keep sharpness, let framerate drop under load
+    await sender.setParameters(params);
+    logStep(`sender params: maxBitrate=${SENDER_MAX_BITRATE}, maxFramerate=${SENDER_MAX_FRAMERATE}, degradationPreference=maintain-resolution`);
+    updateQualityInfo(sender.track);
+  } catch (e) { logStep(`sender setParameters failed: ${e.message || e}`); }
+}
+function updateQualityInfo(track) {
+  const s = track.getSettings ? track.getSettings() : {};
+  const w = s.width || "?", h = s.height || "?", fr = s.frameRate ? Math.round(s.frameRate) : "?";
+  qualityEl.textContent = `capture ${w}×${h} @${fr}fps · sender cap ${(SENDER_MAX_BITRATE / 1e6).toFixed(0)}Mbps/${SENDER_MAX_FRAMERATE}fps · maintain-resolution`;
+}
+
 // ── build a fresh peer connection with the display tracks, then STRICT ORDER: createOffer → setLocalDescription →
 // POST offer (checked) → only then trickle ICE. ICE gathered before the offer lands is BUFFERED so the offer is
 // always the first sharer message (deterministic; not racing behind ICE). ──
@@ -155,12 +183,13 @@ async function negotiate() {
     const s = thePc.iceConnectionState;
     if (s === "connected" || s === "completed") markConnected();
   };
-  for (const t of stream.getTracks()) pc.addTrack(t, stream);
+  const senders = stream.getTracks().map((t) => pc.addTrack(t, stream));
 
   logStep("createOffer…");
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   logStep("setLocalDescription(offer) ok");
+  for (const s of senders) await applyEncodingParams(s);           // raise bitrate cap now the sender/encodings exist
   // data MUST be the full RTCSessionDescription {type,sdp} — the viewer does setRemoteDescription(data)
   logStep(`POST ${SHARE_URL}  body={type:"offer",data:{type,sdp}}`);
   const res = await post("offer", pc.localDescription);
@@ -235,13 +264,21 @@ shareBtn.addEventListener("click", async () => {
   logEl.textContent = "";
   setStatus("Requesting screen…", "", "wait");
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        width: { ideal: CAPTURE_WIDTH_IDEAL }, height: { ideal: CAPTURE_HEIGHT_IDEAL },
+        frameRate: { ideal: CAPTURE_FRAMERATE_IDEAL, max: CAPTURE_FRAMERATE_MAX },
+      },
+      audio: false,
+    });
   } catch (e) {
     setStatus("Screen share cancelled or blocked.", "warn", ""); stream = null; return;   // user cancelled the picker
   }
+  stream.getVideoTracks().forEach((t) => { t.contentHint = "text"; });   // preserve sharpness over motion smoothness
   running = true; connected = false; since = 0; pendingIce.length = 0;
   shareBtn.disabled = true; stopBtn.disabled = false;
   logStep(`screen captured (${stream.getVideoTracks()[0]?.label || "screen"})`);
+  if (stream.getVideoTracks()[0]) updateQualityInfo(stream.getVideoTracks()[0]);   // initial reading; sender cap applied after negotiate
 
   // if the user stops sharing via the browser's own "Stop sharing" UI → tear down
   stream.getVideoTracks().forEach((t) => { t.addEventListener("ended", onTrackEnded); });
@@ -271,6 +308,7 @@ function teardown(msg, kind, dot, reason) {
   if (wasActive) resetRoom();                            // clear the mailbox for the next session
   shareBtn.disabled = false; stopBtn.disabled = true;
   if (msg !== undefined && msg !== null) setStatus(msg, kind || "", dot || "");
+  qualityEl.textContent = "capture — · sender cap —";
 }
 
 function stopSharing() { teardown("Stopped. Click “Share Screen” to share again.", "", "", "Stop clicked"); }
