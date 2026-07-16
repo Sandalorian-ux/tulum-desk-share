@@ -31,6 +31,11 @@
   button:active { transform: scale(0.97); }
   button:disabled { opacity: 0.4; cursor: default; filter: none; }
   #stop { border-color: #7a3a3a; background: linear-gradient(#4a1f1f, #331616); }
+  .modeToggle { margin: 4px 0 0; }
+  .modeToggle button {
+    min-width: 84px; padding: 8px 16px; font: 600 13px system-ui, sans-serif; opacity: 0.5; margin: 4px 3px;
+  }
+  .modeToggle button.active { opacity: 1; border-color: #35d67a; background: linear-gradient(#164254, #103a2c); }
   .status {
     margin-top: 20px; padding: 12px 14px; border-radius: 10px; font-size: 14px;
     background: #0a1620; border: 1px solid #16323f; min-height: 20px;
@@ -61,6 +66,10 @@
       <button id="share">Share Screen</button>
       <button id="stop" disabled>Stop</button>
     </div>
+    <div class="modeToggle">
+      <button id="modeText" class="active" type="button">TEXT</button>
+      <button id="modeVideo" type="button">VIDEO</button>
+    </div>
     <div id="status" class="status"><span class="dot" id="dot"></span><span id="msg">Idle — click “Share Screen” to begin.</span></div>
     <div class="meta">room <code id="room">tulum-desk</code> · role <code>sharer</code> · signal <code id="base">…</code></div>
     <div class="meta" id="quality">capture — · sender cap —</div>
@@ -75,13 +84,22 @@ const ROOM = "tulum-desk";          // fixed shared room code (auto-pair, no pin
 const ROLE = "sharer";              // this page; the venue is "viewer"
 const ICE  = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
 const POLL_MS = 700;                // inbox poll cadence DURING the connect handshake only
-// TEXT-SHARPNESS TUNING (LAN, bandwidth not a constraint): capture is high-res/low-framerate (static text
-// reads better than smooth motion here), and the sender's bitrate cap is raised so the encoder never has to
-// trade sharpness for bitrate at 1080p+. degradationPreference keeps resolution over framerate under load.
+// TEXT/VIDEO QUALITY PROFILES (LAN, bandwidth not a constraint). TEXT (default) favors sharpness for reading
+// terminals/pages: low framerate, maintain-resolution. VIDEO favors smooth motion: higher framerate,
+// maintain-framerate. Capture resolution (2560x1440 ideal) is shared by both; only framerate/encoding differ.
 const CAPTURE_WIDTH_IDEAL = 2560, CAPTURE_HEIGHT_IDEAL = 1440;
-const CAPTURE_FRAMERATE_IDEAL = 15, CAPTURE_FRAMERATE_MAX = 30;
-const SENDER_MAX_BITRATE = 10_000_000;   // bps — crisp 1080p+ text over LAN
-const SENDER_MAX_FRAMERATE = 30;
+const CAPTURE_FRAMERATE_MAX = 60;        // ceiling requested from getDisplayMedia; VIDEO mode can use up to this
+const PROFILES = {
+  text: {
+    label: "TEXT", contentHint: "text", frameRateIdeal: 15,
+    maxBitrate: 10_000_000, maxFramerate: 15, degradationPreference: "maintain-resolution",
+  },
+  video: {
+    label: "VIDEO", contentHint: "motion", frameRateIdeal: 30,
+    maxBitrate: 12_000_000, maxFramerate: 30, degradationPreference: "maintain-framerate",
+  },
+};
+let mode = "text";                       // active profile key; toggled live via the TEXT/VIDEO buttons
 // give up (stop polling) if not connected within this window. Default 45s; overridable via ?connectTimeoutMs= for testing.
 const CONNECT_TIMEOUT_MS = (function () { const m = /[?&]connectTimeoutMs=(\d+)/.exec(location.search); return m ? +m[1] : 45000; })();
 // POLL LIFECYCLE (KV-read discipline): polling STARTS only AFTER the offer is posted; STOPS on pc
@@ -92,6 +110,7 @@ console.info('[share] poll lifecycle — START: after offer posted. STOP: pc con
 // ── UI ──
 const $ = (id) => document.getElementById(id);
 const shareBtn = $("share"), stopBtn = $("stop"), msgEl = $("msg"), statusEl = $("status"), dotEl = $("dot"), logEl = $("log"), qualityEl = $("quality");
+const modeTextBtn = $("modeText"), modeVideoBtn = $("modeVideo");
 $("base").textContent = SIGNAL_BASE.replace("https://", "");
 const SHARE_URL = `${SIGNAL_BASE}/signal/${ROOM}/${ROLE}`;          // EXACT post target: …/signal/tulum-desk/sharer
 function setStatus(text, kind /* '', 'ok','err','warn' */, dot /* '', 'live','wait','err' */) {
@@ -135,24 +154,45 @@ async function postIce(candidate) {                                // full candi
   if (!r.ok) logStep(`ICE POST failed (HTTP ${r.status}${r.error ? ": " + r.error : ""})`);
 }
 
-// raise the video sender's bitrate cap for crisp text (guarded: encodings[] may be empty pre-negotiation).
-async function applyEncodingParams(sender) {
+// apply a profile's bitrate/framerate cap to a sender (guarded: encodings[] may be empty pre-negotiation; never throws).
+async function applyEncodingParams(sender, profile) {
   if (!sender || !sender.track || sender.track.kind !== "video") return;
   try {
     const params = sender.getParameters();
     if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-    params.encodings[0].maxBitrate = SENDER_MAX_BITRATE;
-    params.encodings[0].maxFramerate = SENDER_MAX_FRAMERATE;
-    params.degradationPreference = "maintain-resolution";         // keep sharpness, let framerate drop under load
+    params.encodings[0].maxBitrate = profile.maxBitrate;
+    params.encodings[0].maxFramerate = profile.maxFramerate;
+    params.degradationPreference = profile.degradationPreference;
     await sender.setParameters(params);
-    logStep(`sender params: maxBitrate=${SENDER_MAX_BITRATE}, maxFramerate=${SENDER_MAX_FRAMERATE}, degradationPreference=maintain-resolution`);
-    updateQualityInfo(sender.track);
+    logStep(`sender params [${profile.label}]: maxBitrate=${profile.maxBitrate}, maxFramerate=${profile.maxFramerate}, degradationPreference=${profile.degradationPreference}`);
   } catch (e) { logStep(`sender setParameters failed: ${e.message || e}`); }
 }
-function updateQualityInfo(track) {
-  const s = track.getSettings ? track.getSettings() : {};
-  const w = s.width || "?", h = s.height || "?", fr = s.frameRate ? Math.round(s.frameRate) : "?";
-  qualityEl.textContent = `capture ${w}×${h} @${fr}fps · sender cap ${(SENDER_MAX_BITRATE / 1e6).toFixed(0)}Mbps/${SENDER_MAX_FRAMERATE}fps · maintain-resolution`;
+function updateQualityInfo(track, profile) {
+  profile = profile || PROFILES[mode];
+  const s = track && track.getSettings ? track.getSettings() : {};
+  const w = s.width || "—", h = s.height || "—", fr = s.frameRate ? Math.round(s.frameRate) : "—";
+  qualityEl.textContent = `[${profile.label}] capture ${w}×${h} @${fr}fps · sender cap ${(profile.maxBitrate / 1e6).toFixed(0)}Mbps/${profile.maxFramerate}fps · ${profile.degradationPreference}`;
+}
+function updateModeButtons() {
+  modeTextBtn.classList.toggle("active", mode === "text");
+  modeVideoBtn.classList.toggle("active", mode === "video");
+}
+// live re-apply: contentHint + frameRate constraint on the track, encoding params on the sender (if one exists yet).
+// Never renegotiates and never throws — every step is independently guarded so a toggle can never drop the call.
+async function applyProfile(newMode) {
+  const profile = PROFILES[newMode];
+  if (!profile) return;
+  mode = newMode;
+  updateModeButtons();
+  const track = stream && stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
+  if (!track) { updateQualityInfo(null, profile); return; }             // mode remembered; nothing live to re-apply yet
+  try { track.contentHint = profile.contentHint; } catch (e) {}
+  try { await track.applyConstraints({ frameRate: { ideal: profile.frameRateIdeal, max: CAPTURE_FRAMERATE_MAX } }); }
+  catch (e) { logStep(`applyConstraints(frameRate) failed: ${e.message || e}`); }
+  const sender = pc && pc.getSenders ? pc.getSenders().find((s) => s.track && s.track.kind === "video") : null;
+  if (sender) await applyEncodingParams(sender, profile);
+  updateQualityInfo(track, profile);
+  logStep(`mode → ${profile.label} (live re-apply, no renegotiation)`);
 }
 
 // ── build a fresh peer connection with the display tracks, then STRICT ORDER: createOffer → setLocalDescription →
@@ -189,7 +229,7 @@ async function negotiate() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   logStep("setLocalDescription(offer) ok");
-  for (const s of senders) await applyEncodingParams(s);           // raise bitrate cap now the sender/encodings exist
+  for (const s of senders) await applyEncodingParams(s, PROFILES[mode]);   // apply the active profile now senders/encodings exist
   // data MUST be the full RTCSessionDescription {type,sdp} — the viewer does setRemoteDescription(data)
   logStep(`POST ${SHARE_URL}  body={type:"offer",data:{type,sdp}}`);
   const res = await post("offer", pc.localDescription);
@@ -267,18 +307,17 @@ shareBtn.addEventListener("click", async () => {
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         width: { ideal: CAPTURE_WIDTH_IDEAL }, height: { ideal: CAPTURE_HEIGHT_IDEAL },
-        frameRate: { ideal: CAPTURE_FRAMERATE_IDEAL, max: CAPTURE_FRAMERATE_MAX },
+        frameRate: { ideal: PROFILES[mode].frameRateIdeal, max: CAPTURE_FRAMERATE_MAX },
       },
       audio: false,
     });
   } catch (e) {
     setStatus("Screen share cancelled or blocked.", "warn", ""); stream = null; return;   // user cancelled the picker
   }
-  stream.getVideoTracks().forEach((t) => { t.contentHint = "text"; });   // preserve sharpness over motion smoothness
   running = true; connected = false; since = 0; pendingIce.length = 0;
   shareBtn.disabled = true; stopBtn.disabled = false;
   logStep(`screen captured (${stream.getVideoTracks()[0]?.label || "screen"})`);
-  if (stream.getVideoTracks()[0]) updateQualityInfo(stream.getVideoTracks()[0]);   // initial reading; sender cap applied after negotiate
+  await applyProfile(mode);                              // contentHint + frameRate for the active mode (default TEXT)
 
   // if the user stops sharing via the browser's own "Stop sharing" UI → tear down
   stream.getVideoTracks().forEach((t) => { t.addEventListener("ended", onTrackEnded); });
@@ -308,12 +347,18 @@ function teardown(msg, kind, dot, reason) {
   if (wasActive) resetRoom();                            // clear the mailbox for the next session
   shareBtn.disabled = false; stopBtn.disabled = true;
   if (msg !== undefined && msg !== null) setStatus(msg, kind || "", dot || "");
-  qualityEl.textContent = "capture — · sender cap —";
+  updateQualityInfo(null, PROFILES[mode]);
 }
 
 function stopSharing() { teardown("Stopped. Click “Share Screen” to share again.", "", "", "Stop clicked"); }
 function onTrackEnded() { teardown("Screen sharing ended. Click “Share Screen” to share again.", "", "", "screen-share track ended"); }
 stopBtn.addEventListener("click", stopSharing);
+
+// ── TEXT/VIDEO TOGGLE — applies live to the running track/sender; never renegotiates, never throws ──
+modeTextBtn.addEventListener("click", () => applyProfile("text"));
+modeVideoBtn.addEventListener("click", () => applyProfile("video"));
+updateModeButtons();
+updateQualityInfo(null, PROFILES[mode]);   // initial idle reading
 
 // clean up if the tab closes — stop polling, close the pc, stop tracks, best-effort reset (fire-and-forget beacon)
 window.addEventListener("beforeunload", () => {
